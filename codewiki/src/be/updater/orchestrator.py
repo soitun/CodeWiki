@@ -9,7 +9,7 @@ import traceback
 from typing import Any
 
 from codewiki.src.be.backend import LLMBackend
-from codewiki.src.be.cluster_modules import cluster_modules
+from codewiki.src.be.cluster_modules import cluster_modules, get_clustering_input_token_count
 from codewiki.src.be.dependency_analyzer.models.core import Node
 from codewiki.src.be.updater import pages as P
 from codewiki.src.be.updater import tree as T
@@ -41,7 +41,12 @@ from codewiki.src.be.updater.reference_index import (
 )
 from codewiki.src.be.updater.routing import RoutingAgent
 from codewiki.src.be.updater.stale_scan import StaleScanner
-from codewiki.src.be.updater.tree_repair import RepairResult, repair_tree
+from codewiki.src.be.updater.tree_repair import (
+    RULE_AGENT,
+    RepairResult,
+    RoutingDecision,
+    repair_tree,
+)
 from codewiki.src.config import MODULE_TREE_FILENAME, Config
 from codewiki.src.utils import file_manager
 
@@ -84,6 +89,17 @@ class IncrementalUpdater:
             tree = T.virtual_whole_repo_tree(P.OVERVIEW_STEM, sorted(old_graph))
             self.record.detector_notes.append("whole-repository mode: one virtual leaf (overview)")
         return old_graph, tree
+
+    def _route_to_overview(
+        self, orphans: list[str], context: dict[str, Any]
+    ) -> list[RoutingDecision]:
+        """Whole-repository mode: every orphan belongs to the single page."""
+        return [
+            RoutingDecision(
+                cid, RULE_AGENT, (P.OVERVIEW_STEM,), detail="whole-repository mode: single page"
+            )
+            for cid in orphans
+        ]
 
     def _module_path(self, path: tuple[str, ...]) -> list[str]:
         if self.whole_repo and path == (P.OVERVIEW_STEM,):
@@ -253,6 +269,12 @@ class IncrementalUpdater:
             if self.opts.use_routing_agent
             else None
         )
+        if self.whole_repo:
+            # One page documents everything: orphans go to the virtual leaf
+            # without an LLM call and without creating leaves. Each created
+            # leaf would otherwise map back onto the overview page and rewrite
+            # it once more in Step 5 (issue #113).
+            router = self._route_to_overview
         repair: RepairResult = repair_tree(
             old_tree, diff, new_graph, tracked_new, self.opts, route_orphans=router
         )
@@ -288,11 +310,43 @@ class IncrementalUpdater:
         ratios["fired"] = (
             ratios["r_leaf"] >= self.opts.tau_full or ratios["r_tree"] >= self.opts.tau_tree
         )
-        if self.whole_repo and ratios["fired"]:
-            # One virtual leaf: any change is 100% active by construction, and
-            # patching that single page is exactly the incremental step.
-            ratios["fired"] = False
-            ratios["note"] = "whole-repository mode: fallback rule not applied"
+        if self.whole_repo:
+            # One virtual leaf: any change is 100% active by construction, so
+            # r_leaf says nothing. What matters is whether the *current* scope
+            # still fits one page under the same threshold a fresh build uses
+            # to skip clustering. A whole-repo baseline built from a narrow
+            # --include and then updated against the full repo does not, and
+            # feeding that to the single-page agent runs unbounded (issue #113).
+            scope = [c for c in leaf_nodes if c in new_graph]
+            tokens = get_clustering_input_token_count(scope, new_graph)
+            threshold = self.config.max_token_per_module
+            ratios["clustering_tokens"] = tokens
+            ratios["tau_cluster"] = threshold
+            if tokens <= threshold:
+                ratios["fired"] = False
+                note = "whole-repository mode: scope still fits one page; fallback rule not applied"
+                ratios["note"] = note
+                logger.info(
+                    "Whole-repository mode: current scope is %d clustering tokens "
+                    "(threshold %d, %d leaf nodes); updating the single page in place",
+                    tokens,
+                    threshold,
+                    len(scope),
+                )
+            else:
+                ratios["fired"] = True
+                ratios["note"] = (
+                    "whole-repository baseline but current scope exceeds the clustering "
+                    "threshold; a fresh build would cluster, so fall back to a full build"
+                )
+                rec.detector_notes.append(ratios["note"])
+                logger.warning(
+                    "Whole-repository baseline cannot be updated in place: current scope is "
+                    "%d clustering tokens (threshold %d, %d leaf nodes); falling back to a full build",
+                    tokens,
+                    threshold,
+                    len(scope),
+                )
         rec.fallback = ratios
         if ratios["fired"]:
             rec.outcome = OUTCOME_FULL_FALLBACK
@@ -311,6 +365,13 @@ class IncrementalUpdater:
 
         # ---- Step 5: sequential leaf agents
         order = order_active(active, new_tree, new_graph)
+        if self.whole_repo and len(order) > 1:
+            # Every active unit is the same overview page; regenerate it once.
+            overview_path = (P.OVERVIEW_STEM,)
+            order = [overview_path if overview_path in reports else order[0]]
+            rec.detector_notes.append(
+                f"whole-repository mode: {len(active)} active units collapsed into one overview run"
+            )
         dep = T.leaf_dependents(new_tree, new_graph)
         inv = inverse(ref_index)
         rec.active = [

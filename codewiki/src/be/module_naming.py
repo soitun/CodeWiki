@@ -8,6 +8,7 @@ inserted into the tree (issue #76).
 """
 
 import os
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set
 
 import logging
@@ -95,6 +96,66 @@ def normalize_sub_module_specs(
                 final_name,
             )
     return name_map
+
+
+@dataclass
+class SubModulePlan:
+    """What ``generate_sub_module_documentation`` will actually create.
+
+    ``name_map``: requested name -> final, unique file stem to generate.
+    ``skipped``: requested name -> reason it is not generated (already
+    documented under that name or its parent-prefixed variant).
+    """
+
+    name_map: Dict[str, str] = field(default_factory=dict)
+    skipped: Dict[str, str] = field(default_factory=dict)
+
+
+def plan_sub_module_specs(
+    sub_module_specs: Dict[str, Any],
+    parent_name: Optional[str],
+    module_tree: Dict[str, Any],
+    working_dir: str,
+) -> SubModulePlan:
+    """Decide which requested sub-modules to generate (issue #113).
+
+    Like :func:`normalize_sub_module_specs`, a name that collides with the
+    tree, a ``.md`` on disk or a reserved stem gets the parent prefix. Unlike
+    it, a request whose plain *and* prefixed names are both taken is treated
+    as a repeat of something already documented and skipped, never renamed
+    with a numeric suffix: that suffixing is what let one agent regenerate the
+    same modules as ``x_2``, ``x_3``, ... without ever converging.
+    """
+    taken = collect_module_tree_names(module_tree)
+    taken |= _existing_doc_stems(working_dir)
+    taken |= RESERVED_STEMS
+
+    plan = SubModulePlan()
+    for requested_name in sub_module_specs:
+        name = sanitize_module_name(requested_name)
+        if name not in taken:
+            final_name = name
+        else:
+            prefixed = f"{sanitize_module_name(parent_name)}_{name}" if parent_name else name
+            if prefixed in taken:
+                existing = name if name in taken else prefixed
+                reason = f"already documented as {existing}.md; do not request it again"
+                plan.skipped[requested_name] = reason
+                logger.info(
+                    "Sub-module '%s' already documented as '%s'; skipping duplicate request.",
+                    requested_name,
+                    existing,
+                )
+                continue
+            final_name = prefixed
+            logger.info(
+                "Sub-module name '%s' collides with an existing module or file; renamed to '%s'.",
+                requested_name,
+                final_name,
+            )
+        taken.add(final_name)
+        plan.name_map[requested_name] = final_name
+    return plan
 
 
 def dedupe_module_tree_names(module_tree: Dict[str, Any]) -> Dict[str, Any]:
