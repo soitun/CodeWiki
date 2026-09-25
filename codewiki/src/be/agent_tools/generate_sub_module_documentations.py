@@ -3,7 +3,7 @@ import os
 from pydantic_ai import RunContext, Tool, Agent
 
 from codewiki.src.be.agent_tools.deps import CodeWikiDeps
-from codewiki.src.be.module_naming import normalize_sub_module_specs
+from codewiki.src.be.module_naming import plan_sub_module_specs
 from codewiki.src.be.agent_tools.read_code_components import read_code_components_tool
 from codewiki.src.be.agent_tools.str_replace_editor import str_replace_editor_tool
 from codewiki.src.be.llm_services import create_fallback_models
@@ -25,9 +25,10 @@ async def generate_sub_module_documentation(
         sub_module_specs: A dictionary mapping sub-module names to their core component IDs.
             Example: {"authentication": ["auth_handler.py::AuthHandler", "auth_middleware.py::verify_token"], "database": ["db_client.py::DBClient", "models.py::UserModel"]}
             Each key is a descriptive sub-module name, and the value is a list of component IDs from the current module's core components that belong to that sub-module.
-            Sub-module names must be unique across the whole wiki; a name that is already used by another
-            module is automatically prefixed with the current module name, and the tool result reports the
-            final file names actually saved.
+            Sub-module names must be unique across the whole wiki. A name already used by another module is
+            prefixed with the current module name; a name that is already documented (plain or prefixed)
+            is SKIPPED, not regenerated. The tool result reports the final file names actually saved and
+            every skipped request.
     """
 
     deps = ctx.deps
@@ -38,15 +39,21 @@ async def generate_sub_module_documentation(
 
     # Resolve name collisions against the module tree and files already on disk
     # before touching the tree (issue #76): docs live in one flat directory.
-    name_map = normalize_sub_module_specs(
+    # A request that is already documented (plain or parent-prefixed name) is
+    # skipped rather than renamed x_2, x_3, ... (issue #113).
+    plan = plan_sub_module_specs(
         sub_module_specs,
         previous_module_name,
         deps.module_tree,
         deps.absolute_docs_path,
     )
+    name_map = plan.name_map
+    if not name_map:
+        return _skipped_report(plan.skipped, deps.current_module_name)
     final_specs = {
         name_map[requested_name]: core_component_ids
         for requested_name, core_component_ids in sub_module_specs.items()
+        if requested_name in name_map
     }
 
     # add the sub-module to the module tree
@@ -135,7 +142,20 @@ async def generate_sub_module_documentation(
     if missing:
         report += f" MISSING (generation did not produce these files): {', '.join(missing)}."
         logger.warning("Sub-module documentation missing after generation: %s", ", ".join(missing))
+    if plan.skipped:
+        report += " " + _skipped_report(plan.skipped, deps.current_module_name)
     return report
+
+
+def _skipped_report(skipped: dict[str, str], current_module_name: str) -> str:
+    """Tell the parent agent, unambiguously, not to retry skipped sub-modules."""
+    if not skipped:
+        return "No sub-modules were generated."
+    items = ", ".join(f"'{name}' ({reason})" for name, reason in skipped.items())
+    return (
+        f"Skipped sub-modules: {items}. Do NOT call generate_sub_module_documentation again "
+        f"for these; link the existing pages from `{current_module_name}.md` instead."
+    )
 
 
 generate_sub_module_documentation_tool = Tool(

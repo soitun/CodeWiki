@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 from types import SimpleNamespace
 
-from updater_toy import OAUTH, USER, graph_r1, graph_r2, tracked_r2, tree_r1, write_pages
+from updater_toy import OAUTH, USER, graph_r1, graph_r2, node, tracked_r2, tree_r1, write_pages
 
 from codewiki.src.be.agent_tools.str_replace_editor import str_replace_editor
 from codewiki.src.be.backend import AgentReply
@@ -228,3 +228,53 @@ def test_whole_repo_mode(tmp_path):
     assert [a["page"] for a in rec.active] == ["overview"]
     assert json.load(open(docs / "module_tree.json")) == {}
     assert backend.update_calls and backend.update_calls[0][0] == "overview"
+    assert rec.fallback["fired"] is False
+    assert "fits" in rec.fallback["note"]
+    assert rec.fallback["clustering_tokens"] <= rec.fallback["tau_cluster"]
+
+
+def test_whole_repo_orphans_go_to_overview_without_new_leaves(tmp_path):
+    # Issue #113: an added component with no neighbour in the tree used to be
+    # routed by the LLM agent into a *new* leaf; each such leaf then rewrote
+    # the overview page once more. In whole-repo mode orphans belong to the
+    # single page, with no routing call and no created leaves.
+    docs, config, prev = _setup(tmp_path, tree={})
+    for stem in ("auth", "api", "core", "storage", "pipeline"):
+        (docs / f"{stem}.md").unlink()
+    backend = FakeBackend()
+    g2 = graph_r2()
+    for i in range(3):
+        cid = f"src/new/mod{i}.py::Standalone{i}"
+        g2[cid] = node(cid, "class", f"class Standalone{i}:\n    pass\n")
+    tracked = sorted(tracked_r2() | {c for c in g2 if "Standalone" in c})
+    gen = _generator(config, backend)
+    upd = IncrementalUpdater(config, backend, gen, UpdateOptions())
+    rec = asyncio.run(upd.run(prev, g2, tracked, {"old_commit": "old", "new_commit": "new"}))
+    assert rec.outcome == "incremental"
+    assert rec.repair["created_leaves"] == []
+    assert rec.repair["orphans"] == []
+    assert [a["page"] for a in rec.active] == ["overview"]
+    assert backend.complete_calls == []  # no LLM routing
+    # The single page was written exactly once.
+    assert backend.update_calls.count(("overview", backend.update_calls[0][1])) == 1
+    assert len(backend.update_calls) + len(backend.module_calls) <= 2
+
+
+def test_whole_repo_baseline_falls_back_when_scope_needs_clustering(tmp_path):
+    # Issue #113: a whole-repo baseline (empty tree) updated against a scope
+    # that a fresh build would cluster must not be patched as one page.
+    docs, config, prev = _setup(tmp_path, tree={})
+    for stem in ("auth", "api", "core", "storage", "pipeline"):
+        (docs / f"{stem}.md").unlink()
+    config.max_token_per_module = 1
+    backend = FakeBackend()
+    rec = _run(docs, config, prev, backend, UpdateOptions())
+    assert rec.outcome == "full_fallback"
+    assert rec.fallback["fired"] is True
+    assert rec.fallback["clustering_tokens"] > rec.fallback["tau_cluster"] == 1
+    assert any("exceeds the clustering threshold" in n for n in rec.detector_notes)
+    # No agent ran and nothing on disk changed.
+    assert backend.module_calls == []
+    assert backend.update_calls == []
+    assert json.load(open(docs / "module_tree.json")) == {}
+    assert (docs / "overview.md").exists()

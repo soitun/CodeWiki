@@ -28,7 +28,7 @@ from caw import ToolKit, tool
 from mcp.server.fastmcp import Context
 
 from codewiki.src.be.agent_tools.deps import CodeWikiDeps
-from codewiki.src.be.module_naming import normalize_sub_module_specs
+from codewiki.src.be.module_naming import plan_sub_module_specs
 
 if TYPE_CHECKING:
     from codewiki.src.be.caw_backend import CawBackend
@@ -242,9 +242,10 @@ class CawToolKit(
             "sub_module_specs: a dictionary mapping sub-module names to their core component IDs. "
             "Example: {'authentication': ['auth_handler.py::AuthHandler'], "
             "'database': ['db_client.py::DBClient']}\n"
-            "Sub-module names must be unique across the whole wiki; a name already used by another "
-            "module is automatically prefixed with the current module name, and the tool result "
-            "reports the final file names actually saved."
+            "Sub-module names must be unique across the whole wiki. A name already used by another "
+            "module is prefixed with the current module name; a name that is already documented "
+            "(plain or prefixed) is SKIPPED, not regenerated. The result reports the files actually "
+            "saved and every skipped request."
         )
     )
     async def generate_sub_module_documentation(
@@ -284,15 +285,21 @@ class CawToolKit(
 
         # Resolve name collisions against the module tree and files already on
         # disk before touching the tree (issue #76): docs live in one flat directory.
-        name_map = normalize_sub_module_specs(
+        # A request that is already documented (plain or parent-prefixed name) is
+        # skipped rather than renamed x_2, x_3, ... (issue #113).
+        plan = plan_sub_module_specs(
             sub_module_specs,
             previous_module_name,
             deps.module_tree,
             deps.absolute_docs_path,
         )
+        name_map = plan.name_map
+        if not name_map:
+            return _skipped_report(plan.skipped, deps.current_module_name)
         final_specs = {
             name_map[requested_name]: core_ids
             for requested_name, core_ids in sub_module_specs.items()
+            if requested_name in name_map
         }
 
         # Add sub-modules to the in-memory module tree.
@@ -352,4 +359,17 @@ class CawToolKit(
             logger.warning(
                 "Sub-module documentation missing after generation: %s", ", ".join(missing)
             )
+        if plan.skipped:
+            report += " " + _skipped_report(plan.skipped, deps.current_module_name)
         return report
+
+
+def _skipped_report(skipped: dict[str, str], current_module_name: str) -> str:
+    """Tell the parent agent, unambiguously, not to retry skipped sub-modules."""
+    if not skipped:
+        return "No sub-modules were generated."
+    items = ", ".join(f"'{name}' ({reason})" for name, reason in skipped.items())
+    return (
+        f"Skipped sub-modules: {items}. Do NOT call generate_sub_module_documentation again "
+        f"for these; link the existing pages from `{current_module_name}.md` instead."
+    )
